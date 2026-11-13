@@ -28,7 +28,9 @@ def is_fake() -> bool:
 @lru_cache(maxsize=1)
 def _chat():
     from langchain.chat_models import init_chat_model
-    return init_chat_model(MODEL, temperature=0)
+    # No temperature: Claude Sonnet 5.5 rejects non-default sampling values (langchain-anthropic raises
+    # before sending), and newer API versions reject temperature on every model.
+    return init_chat_model(MODEL)
 
 
 # --------------------------------------------------------------------------- email -> QuoteRequest
