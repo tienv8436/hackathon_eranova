@@ -15,7 +15,8 @@ def render() -> None:
     ss = st.session_state
     triage, quote = b.get("morning_triage", {}), b.get("quote_from_email", {})
 
-    scan = f"1 click, {ss.scan_seconds:.0f} s + review" if ss.scan_seconds is not None else "1 click + review (run a scan)"
+    scan = (f"0 clicks: board ranked in {ss.scan_seconds:.1f} s, + review" if ss.scan_seconds is not None
+            else "0 clicks + review (open the Dispatch board)")
     build = f"1 paste + 1 approve, {ss.quote_seconds:.0f} s" if ss.quote_seconds is not None else "1 paste + 1 approve (build a quote)"
     st.table({
         "Task": ["Find what needs attention this morning", "Price and create a quote from an email", "Quotes sent below margin"],

@@ -43,8 +43,10 @@ def use_fake() -> bool:
 
 
 def apply_data_source() -> None:
-    """meridian.client reads DEMO_MODE on every call, so switching takes effect immediately."""
-    os.environ["DEMO_MODE"] = "1" if st.session_state.data_source.startswith("Snapshots") else "0"
+    """meridian.client reads DEMO_MODE on every call, so switching takes effect immediately.
+    Fake data reads the snapshots too, so the load watch and tracking show the same loads; what makes
+    it "fake" is the templated text in place of model calls."""
+    os.environ["DEMO_MODE"] = "0" if st.session_state.data_source == "Live API" else "1"
 
 
 @st.cache_data

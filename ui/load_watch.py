@@ -11,36 +11,27 @@ from meridian.models import RiskItem
 
 from . import state
 from . import tracking as tracking_ui
-from .fake_data import fake_dashboard_tiles, fake_risk_items
 
 SEVERITY_STYLE = {"HIGH": ":red-background[**HIGH**]", "MEDIUM": ":orange-background[**MEDIUM**]", "LOW": ":gray-background[**LOW**]"}
-FAKE_STEPS = ["Loading 47 open loads…", "Checking carriers…", "Checking appointments…", "Ranking…", "Writing explanations…"]
 
 
 def _tiles() -> list[dict]:
-    if state.use_fake():
-        return fake_dashboard_tiles()
-    res = client.dashboard_counts()
+    res = client.dashboard_counts()   # fake data reads the snapshot (state.apply_data_source)
     return res["data"]["tiles"] if res["ok"] else []
 
 
 def _scan() -> None:
     t0 = time.perf_counter()
     with st.status("Scanning your loads…", expanded=True) as status:
-        if state.use_fake():
-            for msg in FAKE_STEPS:
-                status.write(msg)
-                time.sleep(0.3)
-            items, loads = fake_risk_items(), 47
-        else:
-            # LATE_ETA uses tracking (check calls + legal driving hours) as of the tracking tab's time;
-            # every rule is judged on that same date.
-            tracked = tracking_ui.current_statuses()
-            statuses, at = tracked if tracked else ({}, None)
-            today = at.astimezone(geo.tz(tracking_ui.CLOCK_TZ)).date() if at else None
-            items = risk_playbook.scan(on_step=status.write, tracking=statuses, today=today)
-            loads = len({it.record_id for it in items})
-            st.session_state.scan_as_of = at
+        # LATE_ETA uses tracking (check calls + legal driving hours) as of the tracking tab's time;
+        # every rule is judged on that same date. Fake data runs the same rules on the snapshot,
+        # with templated text instead of model calls.
+        tracked = tracking_ui.current_statuses()
+        statuses, at = tracked if tracked else ({}, None)
+        today = at.astimezone(geo.tz(tracking_ui.CLOCK_TZ)).date() if at else None
+        items = risk_playbook.scan(on_step=status.write, tracking=statuses, today=today, templated=state.use_fake())
+        loads = len({it.record_id for it in items})
+        st.session_state.scan_as_of = at
         secs = time.perf_counter() - t0
         status.update(label=f"Copilot found {len(items)} issues across {loads} loads in {secs:.1f} s", state="complete", expanded=False)
     ss = st.session_state
@@ -113,7 +104,9 @@ def render() -> None:
         right.markdown(f"**Copilot found {len(ss.risk_items)} issues across {ss.loads_scanned} loads in {ss.scan_seconds:.1f} s.**")
         if ss.get("scan_as_of"):
             right.caption(f"As of {geo.fmt_local(ss.scan_as_of, tracking_ui.CLOCK_TZ)}. Late-ETA items come from "
-                          "check calls and our ETA at legal driving hours.")
+                          "check calls and our ETA at legal driving hours"
+                          + (", plus the weather & traffic forecast along each route (Live tracking toggle)."
+                             if ss.get("track_outlook", True) else "."))
 
     if not ss.risk_items:
         st.caption("Click **Scan my loads** to find what needs attention.")

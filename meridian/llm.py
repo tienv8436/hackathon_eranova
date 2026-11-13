@@ -117,13 +117,14 @@ class _Writeups(BaseModel):
     items: list[_Writeup]
 
 
-def explain_and_draft(items: list[RiskItem]) -> list[RiskItem]:
-    """Fill explanation, draft_message and draft_audience for each item in ONE model call."""
+def explain_and_draft(items: list[RiskItem], templated: bool = False) -> list[RiskItem]:
+    """Fill explanation, draft_message and draft_audience for each item in ONE model call.
+    templated=True (or MODEL=fake): fill them from a template, no model call."""
     for it in items:
         it.draft_audience = AUDIENCE_BY_KIND[it.kind]
     if not items:
         return items
-    if is_fake():
+    if templated or is_fake():
         for it in items:
             it.explanation = f"(fake model) {it.title}: {it.suggested_action.lower()}."
             it.draft_message = f"(fake model) Draft to {it.draft_audience} about {it.record_type} {it.record_id}."

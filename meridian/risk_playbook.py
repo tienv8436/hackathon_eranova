@@ -50,14 +50,15 @@ def rank(items: list[RiskItem]) -> list[RiskItem]:
 
 
 def scan(top_n: int = 10, today: date | None = None, on_step: StepFn = _noop,
-         tracking: dict[str, TrackingStatus] | None = None) -> list[RiskItem]:
+         tracking: dict[str, TrackingStatus] | None = None, templated: bool = False) -> list[RiskItem]:
+    """templated=True: explanations and drafts from a template instead of the model (fake-data mode)."""
     ctx = gather(today, on_step, tracking)
     if tracking:
         on_step(f"Using tracking for {len(tracking)} trucks")
     on_step("Running risk rules")
     items = rank(risk_rules.run_all(ctx))
     on_step(f"Writing explanations for the top {min(top_n, len(items))}")
-    llm.explain_and_draft(items[:top_n])
+    llm.explain_and_draft(items[:top_n], templated=templated)
     return items
 
 
