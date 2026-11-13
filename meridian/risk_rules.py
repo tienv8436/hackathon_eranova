@@ -15,6 +15,7 @@ from datetime import date
 
 from .geo import fmt_local
 from .models import RiskItem, Severity, TrackingStatus
+from .tracking import LATE_TOLERANCE_MIN
 
 DEFAULT_MARGIN_FLOOR = 18.0   # API default when a customer has no margin_floor_pct (same as pricing.py)
 PRE_PICKUP = {"BOOKED", "COVERED", "DISPATCHED", "AT_PICKUP"}
@@ -430,7 +431,9 @@ def late_eta(ctx: RiskContext) -> list[RiskItem]:
             title = f"Projected {late / 60:.1f} h past the delivery window" + (", misses MABD" if misses_mabd else "")
             action = "Call the driver: confirm location, hours left and ETA; then warn the receiver and customer"
         else:
-            title = st.exceptions[0] if st.exceptions else f"Only {-late} min of slack before the window closes"
+            title = st.exceptions[0] if st.exceptions else (
+                f"Only {-late} min of slack before the window closes" if late <= 0
+                else f"Projected {late} min past the window end (within the {LATE_TOLERANCE_MIN}-min tolerance)")
             action = "Call the driver to confirm location and ETA"
         tz_name = st.delivery_tz
         pos = st.position
