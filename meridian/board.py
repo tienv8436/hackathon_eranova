@@ -29,6 +29,7 @@ from typing import Literal
 from pydantic import BaseModel
 
 from . import tracking
+from .delay_cost import DelayCost
 from .llm import AUDIENCE_BY_KIND
 from .models import RiskItem, TrackingStatus
 from .outlook import DelayOutlook
@@ -72,16 +73,6 @@ class Action(BaseModel):
     draft: str = ""                    # LLM-drafted message from a matching risk item, if any
     draft_audience: str = ""
     risk_kind: str | None = None       # the load-watch item behind it (for drafting or logging a note)
-
-
-class DelayCost(BaseModel):
-    """Slot for the delay cost estimate (build step 6): who pays for the delay, in dollars.
-    Nothing fills it yet."""
-    customer_usd: float | None = None
-    carrier_usd: float | None = None
-    broker_margin_usd: float | None = None
-    basis: list[str] = []              # what the numbers assume
-    simulated: bool = True
 
 
 class LoadView(BaseModel):
@@ -337,7 +328,7 @@ def _lane(ship: dict, risks: list[RiskItem]) -> str:
 
 def view(record_id: str, *, record_type: Literal["shipment", "quote"] = "shipment", shipment: dict | None = None,
          status: TrackingStatus | None = None, outlook: DelayOutlook | None = None,
-         risks: list[RiskItem] | None = None) -> LoadView:
+         risks: list[RiskItem] | None = None, delay_cost: DelayCost | None = None) -> LoadView:
     ship, risks = shipment or {}, risks or []
     # Delivered loads aren't in the open-shipments list, so fall back to the status a risk rule saw.
     stage = (ship.get("held_from") if ship.get("status") == "ON_HOLD" else ship.get("status")) \
@@ -351,14 +342,16 @@ def view(record_id: str, *, record_type: Literal["shipment", "quote"] = "shipmen
         carrier_id=ship.get("carrier_id"), customer_id=ship.get("customer_id"), stage=stage,
         phase=_phase(stage, record_type, signals, risks), urgency=urgency, score=_score(urgency, status, risks),
         headline=headline(signals, status), signals=signals, actions=actions_for(signals, risks, stage),
-        tracking=status, outlook=outlook, risks=risks)
+        tracking=status, outlook=outlook, risks=risks, delay_cost=delay_cost)
 
 
 def build(shipments: dict[str, dict], statuses: dict[str, TrackingStatus], risks: list[RiskItem],
-          outlooks: dict[str, DelayOutlook] | None = None) -> list[LoadView]:
+          outlooks: dict[str, DelayOutlook] | None = None,
+          delay_costs: dict[str, DelayCost] | None = None) -> list[LoadView]:
     """One view per tracked load and per load or quote with a risk item, most urgent first.
-    `statuses` should already have the weather/traffic outlook applied (outlook.apply), as the UI does."""
-    outlooks = outlooks or {}
+    `statuses` should already have the weather/traffic outlook applied (outlook.apply), as the UI does.
+    `delay_costs`: from meridian.delay_cost.estimate_all; a load without one shows cost as unavailable."""
+    outlooks, delay_costs = outlooks or {}, delay_costs or {}
     by_record: dict[tuple[str, str], list[RiskItem]] = {}
     for r in risks:
         by_record.setdefault((r.record_type, r.record_id), []).append(r)
@@ -366,7 +359,8 @@ def build(shipments: dict[str, dict], statuses: dict[str, TrackingStatus], risks
     views = [view(rid, record_type=rtype, shipment=shipments.get(rid) if rtype == "shipment" else None,
                   status=statuses.get(rid) if rtype == "shipment" else None,
                   outlook=outlooks.get(rid) if rtype == "shipment" else None,
-                  risks=by_record.get((rtype, rid), []))
+                  risks=by_record.get((rtype, rid), []),
+                  delay_cost=delay_costs.get(rid) if rtype == "shipment" else None)
              for rtype, rid in keys]
     return sorted(views, key=lambda v: (-v.score, v.record_id))
 
