@@ -9,12 +9,13 @@ Clicking a truck on the Fleet map & feed tab selects it here.
 from __future__ import annotations
 
 import time
+from functools import partial
 
 import altair as alt
 import pandas as pd
 import streamlit as st
 
-from meridian import board, client, geo, llm, risk_playbook, risk_rules, tracking
+from meridian import board, client, delay_cost, geo, llm, risk_playbook, risk_rules, tracking
 from meridian.board import LoadView
 from meridian.models import RiskItem
 
@@ -56,9 +57,13 @@ def get_board() -> tuple[list[LoadView], tracking.Tracker] | None:
         risks, warnings = _risks(key, tr)
     except Exception as e:  # the board still works from tracking alone
         risks, warnings = [], [f"Load-watch rules unavailable: {e}"]
-    views = board.build(tr.shipments, tr.statuses, risks, tr.outlooks)
+    # The cost model is a simulation matched to the snapshot's shipment IDs, so it stays off with the live API.
+    costs, cost_errors = delay_cost.estimate_all(
+        tr.shipments, statuses=tr.statuses, facilities=tr.facilities, outlooks=tr.outlooks,
+    ) if ss.data_source != "Live API" else ({}, [])
+    views = board.build(tr.shipments, tr.statuses, risks, tr.outlooks, delay_costs=costs)
     traffic = sorted({e for o in tr.outlooks.values() for e in o.errors if e.startswith("traffic")})
-    sidebar.note_health(*warnings, *tr.outlook_errors, *traffic)
+    sidebar.note_health(*warnings, *tr.outlook_errors, *traffic, *cost_errors)
     ss.scan_seconds, ss.risk_items, ss.loads_scanned = time.perf_counter() - t0, risks, len(views)
     ss.scoreboard["issues_caught"] = sum(1 for v in views if v.urgency != "FINE")
     return views, tr
@@ -81,7 +86,8 @@ def _header(tr: tracking.Tracker, views: list[LoadView]) -> None:
             "- 🟢 **Fine**: tracked and on time.\n\n"
             "Ranked by urgency, then how late, then missing a must-arrive-by date. **Next step** is the first "
             "action: get a solid ETA from the carrier before moving the appointment or telling the customer.\n\n"
-            "The **Fleet map & feed** tab shows the same loads on a map; click a truck there to open it here.")
+            "Click a load to open it on **Load details**. The **Fleet map & feed** tab shows the same loads "
+            "on a map; clicking a truck there opens it on Load details too.")
 
 
 def _filters(views: list[LoadView]) -> list[LoadView]:
@@ -97,12 +103,23 @@ def _filters(views: list[LoadView]) -> list[LoadView]:
     return [v for v in pool if phase is None or v.phase == phase]
 
 
-def _queue(rows: list[LoadView]) -> str | None:
-    """The ranked table; returns the selected record id."""
+def _open_load(key: str, ids: list[str]) -> None:
+    """A row clicked in the queue: open that load on the Load details tab."""
+    ss = st.session_state
+    rows = ss[key]["selection"]["rows"]
+    if rows:
+        ss.board_selected = ids[rows[0]]
+        ss.main_tab = "Load details"
+        # a fresh table next time, so clicking the same row again still opens it
+        ss.board_queue_nonce = ss.get("board_queue_nonce", 0) + 1
+
+
+def _queue(rows: list[LoadView]) -> None:
+    """The ranked table."""
     ss = st.session_state
     if not rows:
         st.info("Nothing here needs attention.")
-        return None
+        return
     # Plain text in the table: the grid draws on a canvas, where colour emoji can break.
     df = pd.DataFrame([{
         "Urgency": URGENCY_LABEL[v.urgency],
@@ -111,10 +128,11 @@ def _queue(rows: list[LoadView]) -> str | None:
         "Next step": _next_step(v),
         "Who": v.next_action.who.capitalize() if v.next_action else "",
     } for v in rows])
-    event = st.dataframe(
-        df, hide_index=True, on_select="rerun", selection_mode="single-row", row_height=ROW_H,
-        height=min(len(rows), 8) * ROW_H + 38, width="stretch",
-        key=f"board_queue-{ss.get('board_phase')}-{ss.get('board_show_fine')}",   # new filter: fresh selection
+    ids = [v.record_id for v in rows]
+    key = f"board_queue-{ss.get('board_phase')}-{ss.get('board_show_fine')}-{ss.get('board_queue_nonce', 0)}"
+    st.dataframe(
+        df, hide_index=True, on_select=partial(_open_load, key, ids), selection_mode="single-row",   # no args= here
+        row_height=ROW_H, height=min(len(rows), 8) * ROW_H + 38, width="stretch", key=key,
         column_config={
             "Urgency": st.column_config.TextColumn(width=75),
             "Load": st.column_config.TextColumn(width=75),
@@ -122,14 +140,6 @@ def _queue(rows: list[LoadView]) -> str | None:
             "Next step": st.column_config.TextColumn(width="medium"),
             "Who": st.column_config.TextColumn(width=75),
         })
-    ids = [v.record_id for v in rows]
-    if event.selection.rows:
-        picked = ids[event.selection.rows[0]]
-        if picked != ss.get("board_queue_pick"):   # a new click in the table (the map can select too)
-            ss.board_queue_pick = ss.board_selected = picked
-    if ss.get("board_selected") not in ids:
-        ss.board_selected = ids[0]
-    return ss.board_selected
 
 
 def _done(rid: str) -> set[str]:
@@ -247,12 +257,51 @@ def _cost(v: LoadView, ship: dict) -> None:
         st.markdown(f"**At stake on this load:** ${ship['sell_total']:,.0f} billed"
                     + (f", ${ship['gp_amount']:,.0f} margin" if ship.get("gp_amount") is not None else "") + ".")
     if v.delay_cost:
-        c = v.delay_cost
-        st.markdown(" · ".join(f"{who}: ${amt:,.0f}" for who, amt in (
-            ("Customer", c.customer_usd), ("Carrier", c.carrier_usd), ("Our margin", c.broker_margin_usd))
-            if amt is not None))
-    else:
-        st.caption("Dollar cost of the delay, split by who pays (customer / carrier / our margin): not estimated yet.")
+        _delay_cost(v.delay_cost)
+    elif st.session_state.data_source == "Live API":
+        st.caption("Delay cost comes from a simulated cost model, so it is off with the live API.")
+    elif v.record_type == "shipment" and v.tracking and v.tracking.status != "LATE":
+        st.caption("Delay cost: none projected, since tracking has it making the window, and none modeled.")
+    elif v.record_type == "shipment" and v.tracking:
+        # late on the must-arrive-by day only, at a receiver with no MABD program on file: no charge applies
+        st.caption("Delay cost: none projected. It's late for the must-arrive-by date, but this receiver has "
+                   "no MABD chargeback program on file, and nothing is modeled for this load.")
+    elif v.record_type == "shipment":
+        st.caption("Delay cost: no modeled disruption and no tracking ETA to project from, so it's unavailable (not zero).")
+
+
+def _usd(x: float | None) -> str:
+    return "unknown" if x is None else (f"−${-x:,.2f}" if x < 0 else f"${x:,.2f}")
+
+
+def _delay_cost(c: delay_cost.DelayCost) -> None:
+    """Who pays for this load's disruptions (meridian.delay_cost), labelled as simulated."""
+    badge = ":orange-background[PROJECTED]" if c.kind == "projected" else ":gray-background[SIMULATED]"
+    if c.kind == "modeled" and any(e.event_id.startswith("PROJ-") for e in c.events):
+        badge += " :orange-background[+ PROJECTED]"     # the model's events plus what tracking adds (combine)
+    st.markdown(f"**{'Projected delay cost' if c.kind == 'projected' else 'Delay cost'}** {badge} &nbsp; "
+                f"{_usd(c.gross_usd)} in total: "
+                f"customer pays {_usd(c.customer_usd)} · carrier pays {_usd(c.carrier_usd)} · "
+                f"**our margin {_usd(c.broker_margin_usd)}**")
+    if c.gp_before_usd is not None:
+        drop = c.gp_after_usd is not None and c.gp_after_usd < 0
+        st.markdown(f"**Margin:** {_usd(c.gp_before_usd)} → "
+                    + (f":red[**{_usd(c.gp_after_usd)}**] (loses money)" if drop else f"**{_usd(c.gp_after_usd)}**"))
+    for e in c.events:
+        cause = " / ".join(x for x in (e.cause_owner, e.cause_code) if x)
+        st.caption(f"{'↳ ' if e.parent_event_id else ''}{e.label}" + (f" · cause {cause}" if cause else "")
+                   + (f" · {e.detail}" if e.detail else ""))
+    with st.expander("Cost lines, suggestions and assumptions"):
+        st.dataframe(pd.DataFrame([{
+            "Event": ln.event_id, "Line": ln.description or ln.charge_code, "Code": ln.charge_code,
+            "Qty × rate": f"{ln.quantity:g} × ${ln.rate:,.2f}" if ln.quantity is not None and ln.rate is not None else "unknown",
+            "Amount": _usd(ln.amount_usd if ln.sign > 0 or ln.amount_usd is None else -ln.amount_usd),
+            "Paid by": {"BROKER": "Us", "CUSTOMER": "Customer", "CARRIER": "Carrier"}.get(ln.payer, ln.payer.title()),
+        } for ln in c.lines]), hide_index=True, width="stretch")
+        if c.mitigations:
+            st.markdown("**Model's suggestions:** " + "; ".join(c.mitigations))
+        for b in c.basis:
+            st.caption(b)
 
 
 def _draft(v: LoadView, a: board.Action, item: RiskItem | None) -> None:
@@ -294,9 +343,10 @@ def _actions(v: LoadView, tr: tracking.Tracker) -> None:
             # the key carries the state, so ticking it elsewhere (a logged call or note) redraws it
             st.checkbox(f"~~{i}. {a.label}~~" if is_done else f"**{i}. {a.label}**",
                         value=is_done, key=f"bd-done-{rid}-{a.key}-{int(is_done)}",
-                        on_change=_set_done, args=(rid, a.key, not is_done))
-            st.caption(f"{WHO.get(a.who, a.who)} · Because: " + "; ".join(a.why)
-                       + f". Done when: {a.done_when[0].lower()}{a.done_when[1:]}.")
+                        on_change=_set_done, args=(rid, a.key, not is_done),
+                        help=f"Tick when: {a.done_when[0].lower()}{a.done_when[1:]}.")
+            more = f" (+{len(a.why) - 2} more under Evidence)" if len(a.why) > 2 else ""
+            st.caption(f"{WHO.get(a.who, a.who)} · " + "; ".join(a.why[:2]) + more)
             if is_done:
                 continue
             if a.key in ("call_carrier", "confirm_eta") and rid in tr.statuses:
@@ -342,8 +392,8 @@ def _evidence(v: LoadView, tr: tracking.Tracker) -> None:
 
 
 def _selected(v: LoadView, tr: tracking.Tracker) -> None:
-    """The load panel: ① what's happening, ② what it costs, ③ what to do, ④ evidence."""
-    st.divider()
+    """The load panel, top to bottom: ① what's happening (headline, key facts, the planned-vs-projected
+    timeline), ② what it costs, ③ what to do, ④ evidence."""
     ship = tr.shipments.get(v.record_id, {}) if v.record_type == "shipment" else {}
     lane = f" · {v.lane}" if v.lane else ""
     st.markdown(f"#### {URGENCY_DOT[v.urgency]} {v.record_type.capitalize()} {v.record_id}{lane}")
@@ -356,28 +406,59 @@ def _selected(v: LoadView, tr: tracking.Tracker) -> None:
     st.markdown(f"##### {v.headline}")
     if v.tracking:
         _facts(v)
-    left, right = st.columns([3, 2], gap="large")
-    with left:
-        _actions(v, tr)
-    with right:
-        if v.tracking and v.record_id in tr.shipments:
+    timeline = v.tracking is not None and v.record_id in tr.shipments
+    if timeline:
+        left, right = st.columns([3, 2], gap="large")
+        with left:
             _timeline(v, tr)
+        with right:
+            _cost(v, ship)
+    else:
         _cost(v, ship)
+    _actions(v, tr)
     _evidence(v, tr)
 
 
-# --------------------------------------------------------------------------- tab
+# --------------------------------------------------------------------------- tabs
+
+def _open_tab(name: str) -> None:
+    st.session_state.main_tab = name
+
 
 def render() -> None:
+    """Dispatch board tab: the ranked queue. Clicking a load opens it on the Load details tab."""
+    got = get_board()
+    if got is None:
+        return
+    views, tr = got
+    st.session_state.setdefault("board_show_fine", False)
+    _header(tr, views)
+    rows = _filters(views)
+    _queue(rows)
+    if rows:
+        st.caption("Click a load to open it on the **Load details** tab.")
+
+
+def render_details() -> None:
+    """Load details tab: one load's panel. Opened by a click on the board or the fleet map, or pick here."""
     got = get_board()
     if got is None:
         return
     views, tr = got
     ss = st.session_state
-    ss.setdefault("board_show_fine", False)
-    _header(tr, views)
-    rows = _filters(views)
-    sid = _queue(rows)
-    if sid is None:
+    by_id = {v.record_id: v for v in views}
+    ids = list(by_id)                                   # board order: most urgent first
+    if not ids:
+        st.info("No loads to show.")
         return
-    _selected(next(v for v in rows if v.record_id == sid), tr)
+    sel = ss.get("board_selected")
+    if sel not in by_id:
+        sel = ids[0]
+    c1, c2 = st.columns([4, 1], vertical_alignment="bottom")
+    # No widget key: the index follows board_selected, so a click on the board or the map shows here.
+    sel = c1.selectbox("Load", ids, index=ids.index(sel),
+                       format_func=lambda k: f"{URGENCY_LABEL[by_id[k].urgency]} · {k} · {by_id[k].headline}")
+    ss.board_selected = sel
+    c2.button("← Back to the board", on_click=_open_tab, args=("Dispatch board",), width="stretch")
+    st.divider()
+    _selected(by_id[sel], tr)

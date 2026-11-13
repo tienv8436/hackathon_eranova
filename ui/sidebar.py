@@ -59,14 +59,11 @@ def render_scoreboard() -> None:
     with _score_slot:
         st.subheader("Today's scoreboard")
         sb = st.session_state.scoreboard
+        # Time saved and quotes below margin are no longer shown: the manual baseline isn't measured and
+        # email-to-quote is out of scope. state.scoreboard still tracks them for the unused tabs.
         c1, c2 = st.columns(2)
         c1.metric("Items done", sb["items_done"])
-        c2.metric("Time saved", f"~{sb['minutes_saved']:.0f} min")
-        c1.metric("Issues caught", sb["issues_caught"])
-        c2.metric("Quotes below margin", sb["quotes_below_margin"])
-        st.caption("Time saved is estimated from our measured manual baseline.")
-        if state.load_baseline().get("_placeholder"):
-            st.caption(":orange[baseline.json still has placeholder numbers]")
+        c2.metric("Issues caught", sb["issues_caught"])
     health = st.session_state.pop("data_health", [])
     with _health_slot:
         if health:
